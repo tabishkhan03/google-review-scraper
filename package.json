@@ -1,0 +1,22 @@
+{
+  "name": "google-review-scraper",
+  "version": "1.0.0",
+  "description": "A local Google Maps review scraper using Puppeteer and Express",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dayjs": "^1.11.10",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.3",
+    "puppeteer": "^22.3.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
