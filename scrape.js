@@ -32,7 +32,11 @@ class ReviewScraper {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process'
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu',
+      '--window-size=1920,1080'
     ];
     if (proxy) {
       args.push(`--proxy-server=${proxy}`);
@@ -40,7 +44,9 @@ class ReviewScraper {
 
     this.browser = await puppeteer.launch({
       headless: 'new',
-      args
+      args,
+      defaultViewport: { width: 1920, height: 1080 },
+      ignoreHTTPSErrors: true
     });
   }
 
@@ -61,17 +67,24 @@ class ReviewScraper {
 
   // Setup XHR interception
   async setupXHRInterception(page) {
+    // Block unnecessary resources
     await page.setRequestInterception(true);
     
     page.on('request', (request) => {
-      request.continue();
+      const resourceType = request.resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+        request.abort();
+      } else {
+        request.continue();
+      }
     });
 
+    // Optimize response handling
     page.on('response', async (response) => {
       try {
         const url = response.url();
         
-        // Intercept Google Maps review API calls
+        // Only process review-related responses
         if (url.includes('search?tbm=map') || 
             url.includes('listugcposts') || 
             url.includes('preview/review') ||
@@ -85,6 +98,11 @@ class ReviewScraper {
         // Silently handle parsing errors
       }
     });
+
+    // Set page performance optimizations
+    await page.setCacheEnabled(true);
+    await page.setDefaultNavigationTimeout(30000);
+    await page.setDefaultTimeout(30000);
   }
 
   // Parse XHR response for review data
@@ -314,8 +332,7 @@ class ReviewScraper {
         await this.initialize();
 
         const page = await this.browser.newPage();
-        await page.setViewport({ width: 1920, height: 1080 });
-
+        
         // Setup XHR interception
         await this.setupXHRInterception(page);
         this.xhrReviews.clear();
@@ -323,10 +340,10 @@ class ReviewScraper {
         try {
           console.log(`Navigating to place ID: ${placeId} (Attempt ${attempt + 1}/${maxRetries})`);
           await page.goto(`https://www.google.com/maps/place/?q=place_id:${placeId}`, {
-            waitUntil: ['networkidle0', 'domcontentloaded'],
-            timeout: 60000
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
           });
-          await delay(5000);
+          await delay(2000);
 
           // Get place name
           this.placeName = await page.evaluate(() => {
@@ -335,57 +352,77 @@ class ReviewScraper {
           });
           console.log(`Found place: ${this.placeName}`);
 
-          // Click the Reviews button
-          const reviewSelectors = [
-            'button[aria-label*="Reviews"]',
-            'button[data-tab-index="1"]',
-            'button[jsaction*="pane.reviewChart.moreReviews"]'
-          ];
-          let found = false;
-          for (const sel of reviewSelectors) {
-            if (await this.waitForElement(page, sel)) {
-              await page.click(sel);
-              found = true;
-              break;
-            }
-          }
-          if (!found) throw new Error('Could not find the Reviews button');
-
-          await delay(3000);
-
-          // Sort by newest
-          const sortButton = 'button[aria-label*="Sort"]';
-          if (await this.waitForElement(page, sortButton)) {
-            await page.click(sortButton);
+          // Click the Reviews button with optimized selector
+          const reviewButton = await page.waitForSelector('button[aria-label*="Reviews"], button[data-tab-index="1"]', { timeout: 10000 });
+          if (reviewButton) {
+            await reviewButton.click();
             await delay(1000);
-            const options = await page.$$('div[role="menuitemradio"]');
-            for (const opt of options) {
-              const text = await opt.evaluate(el => el.textContent);
-              if (text.includes('Newest')) {
-                await opt.click();
-                break;
+          } else {
+            throw new Error('Could not find the Reviews button');
+          }
+
+          // Try to sort by newest with multiple approaches
+          try {
+            // First attempt: Direct sort button click
+            const sortButton = await page.waitForSelector('button[aria-label*="Sort"]', { timeout: 5000 });
+            if (sortButton) {
+              await sortButton.click();
+              await delay(1000);
+
+              // Try multiple selectors for the newest option
+              const sortSelectors = [
+                'div[role="menuitemradio"]:has-text("Newest")',
+                'div[role="menuitemradio"]',
+                'div[aria-label*="Newest"]',
+                'div[jsaction*="sort"]'
+              ];
+
+              let sorted = false;
+              for (const selector of sortSelectors) {
+                try {
+                  const options = await page.$$(selector);
+                  for (const option of options) {
+                    const text = await option.evaluate(el => el.textContent);
+                    if (text.toLowerCase().includes('newest')) {
+                      await option.click();
+                      sorted = true;
+                      break;
+                    }
+                  }
+                  if (sorted) break;
+                } catch (err) {
+                  continue;
+                }
+              }
+
+              if (!sorted) {
+                console.log('Could not find sort option, continuing without sorting...');
               }
             }
+          } catch (sortError) {
+            console.log('Sorting failed, continuing without sorting:', sortError.message);
           }
 
-          await delay(3000);
+          await delay(2000);
 
-          // Wait for XHR responses and scroll to load more
+          // Optimized review collection
           const reviewMap = new Map();
           let triesWithoutNew = 0;
-          const maxTries = 15;
+          const maxTries = 10;
+          const scrollDelay = 1000;
 
-          console.log('Starting data collection (XHR + DOM fallback)...');
+          console.log('Starting optimized data collection...');
           
           while (triesWithoutNew < maxTries) {
-            // Scroll to trigger more XHR requests
-            await this.scrollReviewContainer(page);
-            await delay(2000);
+            // Parallel operations
+            await Promise.all([
+              this.scrollReviewContainer(page),
+              this.expandAllMoreButtons(page)
+            ]);
             
-            // Expand more buttons to get full content
-            await this.expandAllMoreButtons(page);
+            await delay(scrollDelay);
             
-            // Check XHR collected reviews first
+            // Process XHR reviews
             let newCount = 0;
             for (const [id, review] of this.xhrReviews) {
               if (!reviewMap.has(id)) {
@@ -394,7 +431,7 @@ class ReviewScraper {
               }
             }
 
-            // If XHR didn't get enough, fallback to DOM extraction
+            // Fallback to DOM extraction if needed
             if (this.xhrReviews.size === 0 || newCount === 0) {
               const domReviews = await this.extractReviewsFromDOM(page);
               for (const r of domReviews) {
@@ -415,14 +452,12 @@ class ReviewScraper {
               triesWithoutNew++;
               console.log(`No new reviews found. ${triesWithoutNew}/${maxTries}`);
             } else {
-              console.log(`Collected ${newCount} new reviews. Total: ${reviewMap.size} (XHR: ${this.xhrReviews.size})`);
+              console.log(`Collected ${newCount} new reviews. Total: ${reviewMap.size}`);
               triesWithoutNew = 0;
             }
           }
 
-          console.log(`Finished collecting reviews. XHR: ${this.xhrReviews.size}, Total: ${reviewMap.size}`);
-
-          // Sort by newest first
+          // Process and return results
           const reviews = Array.from(reviewMap.values())
             .sort((a, b) => new Date(b.dateIso) - new Date(a.dateIso))
             .map(review => ({
