@@ -22,6 +22,8 @@ class ProxyRotator {
 class ReviewScraper {
   constructor(proxies) {
     this.proxyRotator = new ProxyRotator(proxies);
+    this.xhrReviews = new Map();
+    this.placeName = '';
   }
 
   async initialize() {
@@ -57,6 +59,198 @@ class ReviewScraper {
     }
   }
 
+  // Setup XHR interception
+  async setupXHRInterception(page) {
+    await page.setRequestInterception(true);
+    
+    page.on('request', (request) => {
+      request.continue();
+    });
+
+    page.on('response', async (response) => {
+      try {
+        const url = response.url();
+        
+        // Intercept Google Maps review API calls
+        if (url.includes('search?tbm=map') || 
+            url.includes('listugcposts') || 
+            url.includes('preview/review') ||
+            url.includes('ludocids') ||
+            (url.includes('maps/api') && url.includes('reviews'))) {
+          
+          const responseText = await response.text();
+          this.parseXHRResponse(responseText);
+        }
+      } catch (error) {
+        // Silently handle parsing errors
+      }
+    });
+  }
+
+  // Parse XHR response for review data
+  parseXHRResponse(responseText) {
+    try {
+      // Handle different response formats
+      let data;
+      
+      // Try to parse as JSON first
+      try {
+        data = JSON.parse(responseText);
+      } catch {
+        // Handle JSONP or other formats
+        const jsonMatch = responseText.match(/(\[.*\])/);
+        if (jsonMatch) {
+          data = JSON.parse(jsonMatch[1]);
+        } else {
+          return;
+        }
+      }
+
+      this.extractReviewsFromData(data);
+    } catch (error) {
+      // Continue silently if parsing fails
+    }
+  }
+
+  // Extract reviews from various data structures
+  extractReviewsFromData(data) {
+    const traverse = (obj) => {
+      if (!obj) return;
+      
+      if (Array.isArray(obj)) {
+        obj.forEach(traverse);
+      } else if (typeof obj === 'object') {
+        // Look for review-like structures
+        if (this.isReviewObject(obj)) {
+          const review = this.parseReviewObject(obj);
+          if (review && review.id) {
+            this.xhrReviews.set(review.id, review);
+          }
+        }
+        
+        // Continue traversing
+        Object.values(obj).forEach(traverse);
+      }
+    };
+    
+    traverse(data);
+  }
+
+  // Check if object looks like a review
+  isReviewObject(obj) {
+    const hasReviewFields = (
+      (obj.hasOwnProperty('rating') || obj.hasOwnProperty('stars')) &&
+      (obj.hasOwnProperty('text') || obj.hasOwnProperty('comment') || obj.hasOwnProperty('review')) &&
+      (obj.hasOwnProperty('author') || obj.hasOwnProperty('reviewer') || obj.hasOwnProperty('name'))
+    );
+    
+    const hasReviewArray = Array.isArray(obj) && obj.length > 3 && 
+      typeof obj[0] === 'string' && typeof obj[1] === 'number';
+    
+    return hasReviewFields || hasReviewArray;
+  }
+
+  // Parse review object into standard format
+  parseReviewObject(obj) {
+    try {
+      let reviewer = '';
+      let rating = 0;
+      let content = '';
+      let dateIso = new Date().toISOString();
+      let id = '';
+
+      if (Array.isArray(obj)) {
+        // Handle array format [reviewer, rating, content, date, ...]
+        reviewer = obj[0] || '';
+        rating = obj[1] || 0;
+        content = obj[2] || '';
+        if (obj[3]) dateIso = this.parseDate(obj[3]);
+        id = this.generateReviewId(reviewer, content, rating);
+      } else {
+        // Handle object format
+        reviewer = obj.author || obj.reviewer || obj.name || '';
+        rating = obj.rating || obj.stars || 0;
+        content = obj.text || obj.comment || obj.review || '';
+        
+        if (obj.date || obj.timestamp) {
+          dateIso = this.parseDate(obj.date || obj.timestamp);
+        }
+        
+        id = obj.id || this.generateReviewId(reviewer, content, rating);
+      }
+
+      return {
+        id,
+        reviewer: reviewer.toString(),
+        rating: this.parseRating(rating),
+        content: content.toString(),
+        dateIso
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  // Generate unique ID for review
+  generateReviewId(reviewer, content, rating) {
+    return Buffer.from(`${reviewer}-${content.substring(0, 50)}-${rating}`).toString('base64');
+  }
+
+  // Parse rating from different formats
+  parseRating(ratingData) {
+    if (typeof ratingData === 'number') return Math.max(0, Math.min(5, ratingData));
+    if (typeof ratingData === 'string') {
+      const match = ratingData.match(/(\d+)/);
+      return match ? Math.max(0, Math.min(5, parseInt(match[1]))) : 0;
+    }
+    return 0;
+  }
+
+  // Parse date from timestamp or relative text
+  parseDate(dateData) {
+    if (!dateData) return new Date().toISOString();
+    
+    // If it's a timestamp (seconds or milliseconds)
+    if (typeof dateData === 'number') {
+      const timestamp = dateData > 1e10 ? dateData : dateData * 1000;
+      return new Date(timestamp).toISOString();
+    }
+    
+    // If it's relative text like "2 weeks ago"
+    if (typeof dateData === 'string') {
+      const now = new Date();
+      const match = dateData.match(/(\d+)\s*(\w+)/);
+      if (match) {
+        const number = parseInt(match[1]);
+        const unit = match[2].toLowerCase();
+        switch (unit) {
+          case 'second':
+          case 'seconds': now.setSeconds(now.getSeconds() - number); break;
+          case 'minute':
+          case 'minutes': now.setMinutes(now.getMinutes() - number); break;
+          case 'hour':
+          case 'hours': now.setHours(now.getHours() - number); break;
+          case 'day':
+          case 'days': now.setDate(now.getDate() - number); break;
+          case 'week':
+          case 'weeks': now.setDate(now.getDate() - number * 7); break;
+          case 'month':
+          case 'months': now.setMonth(now.getMonth() - number); break;
+          case 'year':
+          case 'years': now.setFullYear(now.getFullYear() - number); break;
+        }
+      } else {
+        // Try direct date parsing
+        const parsed = new Date(dateData);
+        if (!isNaN(parsed)) return parsed.toISOString();
+      }
+      return now.toISOString();
+    }
+    
+    return new Date().toISOString();
+  }
+
+  // DOM extraction fallback method
   async scrollReviewContainer(page) {
     await page.evaluate(() => {
       const scrollableDiv = document.querySelector('.m6QErb.DxyBCb.kA9KIf.dS8AEf');
@@ -68,7 +262,6 @@ class ReviewScraper {
 
   async expandAllMoreButtons(page) {
     try {
-      // Click only buttons with aria-expanded="false" that indicate a collapsed "More" section
       await page.evaluate(() => {
         const buttons = Array.from(document.querySelectorAll('button[aria-expanded="false"]'));
         buttons.forEach(btn => {
@@ -78,13 +271,13 @@ class ReviewScraper {
           }
         });
       });
-      await delay(1500); // wait for content to expand
+      await delay(1500);
     } catch (err) {
       console.log('Error expanding More buttons:', err.message);
     }
   }
 
-  async extractNewReviews(page) {
+  async extractReviewsFromDOM(page) {
     return await page.evaluate(() => {
       const reviews = [];
       const elements = document.querySelectorAll('div[data-review-id]');
@@ -95,43 +288,20 @@ class ReviewScraper {
         const rating = el.querySelector('[aria-label*="stars"]')?.getAttribute('aria-label') || '0 stars';
         const content = el.querySelector('.wiI7pd, .MyEned, .review-full-text')?.textContent.trim() || '';
         const dateText = el.querySelector('[aria-label*="ago"]')?.getAttribute('aria-label') || '';
-        reviews.push({ id, name, rating, content, dateText });
+        
+        reviews.push({ 
+          id, 
+          reviewer: name, 
+          rating, 
+          content, 
+          dateText 
+        });
       }
       return reviews;
     });
   }
 
-  parseDate(dateText) {
-    const now = new Date();
-    if (!dateText) return now.toISOString();
-
-    const match = dateText.match(/(\d+)\s(\w+)/);
-    if (match) {
-      const number = parseInt(match[1]);
-      const unit = match[2].toLowerCase();
-      switch (unit) {
-        case 'second':
-        case 'seconds': now.setSeconds(now.getSeconds() - number); break;
-        case 'minute':
-        case 'minutes': now.setMinutes(now.getMinutes() - number); break;
-        case 'hour':
-        case 'hours': now.setHours(now.getHours() - number); break;
-        case 'day':
-        case 'days': now.setDate(now.getDate() - number); break;
-        case 'week':
-        case 'weeks': now.setDate(now.getDate() - number * 7); break;
-        case 'month':
-        case 'months': now.setMonth(now.getMonth() - number); break;
-        case 'year':
-        case 'years': now.setFullYear(now.getFullYear() - number); break;
-      }
-    } else {
-      const parsed = new Date(dateText);
-      if (!isNaN(parsed)) return parsed.toISOString();
-    }
-    return now.toISOString();
-  }
-
+  // Main scraping method with XHR + DOM fallback
   async scrapeReviews(placeId) {
     const maxRetries = 3;
     let lastError = null;
@@ -146,6 +316,10 @@ class ReviewScraper {
         const page = await this.browser.newPage();
         await page.setViewport({ width: 1920, height: 1080 });
 
+        // Setup XHR interception
+        await this.setupXHRInterception(page);
+        this.xhrReviews.clear();
+
         try {
           console.log(`Navigating to place ID: ${placeId} (Attempt ${attempt + 1}/${maxRetries})`);
           await page.goto(`https://www.google.com/maps/place/?q=place_id:${placeId}`, {
@@ -154,11 +328,12 @@ class ReviewScraper {
           });
           await delay(5000);
 
-          const storeName = await page.evaluate(() => {
+          // Get place name
+          this.placeName = await page.evaluate(() => {
             const nameEl = document.querySelector('h1');
-            return nameEl ? nameEl.textContent.trim() : 'Unknown Store';
+            return nameEl ? nameEl.textContent.trim() : 'Unknown Place';
           });
-          console.log(`Found store: ${storeName}`);
+          console.log(`Found place: ${this.placeName}`);
 
           // Click the Reviews button
           const reviewSelectors = [
@@ -193,53 +368,73 @@ class ReviewScraper {
             }
           }
 
-          await delay(2000);
+          await delay(3000);
 
-          // Start infinite scroll and expand all "More" buttons on every scroll
+          // Wait for XHR responses and scroll to load more
           const reviewMap = new Map();
           let triesWithoutNew = 0;
-          const maxTries = 10;
+          const maxTries = 15;
 
-          console.log('Starting scroll loop...');
+          console.log('Starting data collection (XHR + DOM fallback)...');
+          
           while (triesWithoutNew < maxTries) {
+            // Scroll to trigger more XHR requests
             await this.scrollReviewContainer(page);
-            await delay(1500);
-
-            // Expand only collapsed "More" buttons efficiently
+            await delay(2000);
+            
+            // Expand more buttons to get full content
             await this.expandAllMoreButtons(page);
-
-            // Extract reviews with expanded content
-            const newBatch = await this.extractNewReviews(page);
+            
+            // Check XHR collected reviews first
             let newCount = 0;
-            for (const r of newBatch) {
-              if (!reviewMap.has(r.id)) {
-                reviewMap.set(r.id, {
-                  reviewer: r.name,
-                  rating: r.rating,
-                  content: r.content,
-                  dateIso: this.parseDate(r.dateText)
-                });
+            for (const [id, review] of this.xhrReviews) {
+              if (!reviewMap.has(id)) {
+                reviewMap.set(id, review);
                 newCount++;
+              }
+            }
+
+            // If XHR didn't get enough, fallback to DOM extraction
+            if (this.xhrReviews.size === 0 || newCount === 0) {
+              const domReviews = await this.extractReviewsFromDOM(page);
+              for (const r of domReviews) {
+                if (!reviewMap.has(r.id)) {
+                  reviewMap.set(r.id, {
+                    id: r.id,
+                    reviewer: r.reviewer,
+                    rating: this.parseRating(r.rating),
+                    content: r.content,
+                    dateIso: this.parseDate(r.dateText)
+                  });
+                  newCount++;
+                }
               }
             }
 
             if (newCount === 0) {
               triesWithoutNew++;
-              console.log(`No new reviews. ${triesWithoutNew}/${maxTries}`);
+              console.log(`No new reviews found. ${triesWithoutNew}/${maxTries}`);
             } else {
-              console.log(`Fetched ${newCount} new reviews. Total: ${reviewMap.size}`);
+              console.log(`Collected ${newCount} new reviews. Total: ${reviewMap.size} (XHR: ${this.xhrReviews.size})`);
               triesWithoutNew = 0;
             }
           }
 
-          console.log('Finished scrolling and extracting reviews.');
+          console.log(`Finished collecting reviews. XHR: ${this.xhrReviews.size}, Total: ${reviewMap.size}`);
 
-          const reviews = Array.from(reviewMap.values()).sort(
-            (a, b) => new Date(b.dateIso) - new Date(a.dateIso)
-          );
+          // Sort by newest first
+          const reviews = Array.from(reviewMap.values())
+            .sort((a, b) => new Date(b.dateIso) - new Date(a.dateIso))
+            .map(review => ({
+              reviewer: review.reviewer,
+              rating: review.rating,
+              content: review.content,
+              dateIso: review.dateIso
+            }));
 
           return {
-            store: storeName,
+            place_id: placeId,
+            place_name: this.placeName,
             lastScraped: new Date().toISOString(),
             reviews
           };
